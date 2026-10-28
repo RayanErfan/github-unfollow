@@ -2,11 +2,29 @@ package git_hub_manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/go-github/v57/github"
 	"golang.org/x/oauth2"
+)
+
+const (
+	// githubMaxPerPage is the largest page size the GitHub API honours.
+	// Asking for more is silently capped, so always request exactly this.
+	githubMaxPerPage = 100
+
+	// maxRequestAttempts bounds how many times a single call is retried when
+	// GitHub asks us to slow down.
+	maxRequestAttempts = 3
+
+	// maxRateLimitWait is the longest we are willing to block on a single
+	// rate limited call before giving up and letting the caller decide.
+	maxRateLimitWait = 2 * time.Minute
 )
 
 type GitHubManager struct {
@@ -15,59 +33,77 @@ type GitHubManager struct {
 }
 
 func NewGitHubManager(token string, username string) *GitHubManager {
-	var ctx = context.Background()
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
+	tc := oauth2.NewClient(context.Background(), ts)
 
+	return NewGitHubManagerWithClient(github.NewClient(tc), username)
+}
+
+// NewGitHubManagerWithClient builds a manager around an existing client.
+// It exists so tests can point the client at a local server.
+func NewGitHubManagerWithClient(client *github.Client, username string) *GitHubManager {
 	return &GitHubManager{
 		client:   client,
 		username: username,
 	}
 }
 
+// userPageFetcher fetches one page of users.
+type userPageFetcher func(ctx context.Context, opts *github.ListOptions) ([]*github.User, *github.Response, error)
+
 func (gm *GitHubManager) GetFollowers(name *string) ([]string, error) {
-	var allFollowers []string
 	username := gm.username
 	if name != nil {
 		username = *name
 	}
-	ctx := context.Background()
-	opts := &github.ListOptions{PerPage: 100}
-	for {
-		followers, resp, err := gm.client.Users.ListFollowers(ctx, username, opts)
-		if err != nil {
-			return nil, err
-		}
-		for _, follower := range followers {
-			allFollowers = append(allFollowers, follower.GetLogin())
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	return allFollowers, nil
+
+	return gm.listAllUsers(context.Background(),
+		func(ctx context.Context, opts *github.ListOptions) ([]*github.User, *github.Response, error) {
+			return gm.client.Users.ListFollowers(ctx, username, opts)
+		})
 }
 
 func (gm *GitHubManager) GetFollowing() ([]string, error) {
-	var allFollowing []string
-	ctx := context.Background()
-	opts := &github.ListOptions{PerPage: 200}
+	return gm.listAllUsers(context.Background(),
+		func(ctx context.Context, opts *github.ListOptions) ([]*github.User, *github.Response, error) {
+			return gm.client.Users.ListFollowing(ctx, gm.username, opts)
+		})
+}
+
+// listAllUsers walks *every* page of a paginated endpoint. It keeps following
+// resp.NextPage until GitHub reports that there is no next page, so accounts
+// with more than one page of followers/following are never cut short.
+func (gm *GitHubManager) listAllUsers(ctx context.Context, fetch userPageFetcher) ([]string, error) {
+	var (
+		all  []string
+		seen = make(map[string]struct{})
+		opts = &github.ListOptions{PerPage: githubMaxPerPage}
+	)
+
 	for {
-		following, resp, err := gm.client.Users.ListFollowing(ctx, gm.username, opts)
+		users, resp, err := fetch(ctx, opts)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list users (page %d): %w", opts.Page, err)
 		}
-		for _, follower := range following {
-			allFollowing = append(allFollowing, follower.GetLogin())
+
+		for _, user := range users {
+			login := user.GetLogin()
+			if login == "" {
+				continue
+			}
+			if _, ok := seen[login]; ok {
+				continue
+			}
+			seen[login] = struct{}{}
+			all = append(all, login)
 		}
-		if resp.NextPage == 0 {
-			break
+
+		if resp == nil || resp.NextPage == 0 {
+			return all, nil
 		}
+
 		opts.Page = resp.NextPage
 	}
-	return allFollowing, nil
 }
 
 func (gm *GitHubManager) DiffUsernames(users1 []string, users2 []string) []string {
@@ -85,21 +121,116 @@ func (gm *GitHubManager) DiffUsernames(users1 []string, users2 []string) []strin
 }
 
 func (gm *GitHubManager) UnfollowUser(username string, delay int) error {
-	ctx := context.Background()
 	time.Sleep(time.Duration(delay) * time.Millisecond)
-	_, err := gm.client.Users.Unfollow(ctx, username)
+
+	err := gm.withRetry(func(ctx context.Context) error {
+		_, err := gm.client.Users.Unfollow(ctx, username)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("error to unfollow %s: %v", username, err)
+		return fmt.Errorf("error to unfollow %s: %w", username, err)
 	}
+
 	return nil
 }
 
 func (gm *GitHubManager) FollowUser(username string, delay int) error {
-	ctx := context.Background()
 	time.Sleep(time.Duration(delay) * time.Millisecond)
-	_, err := gm.client.Users.Follow(ctx, username)
+
+	err := gm.withRetry(func(ctx context.Context) error {
+		_, err := gm.client.Users.Follow(ctx, username)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("error to follow %s: %v", username, err)
+		return fmt.Errorf("error to follow %s: %w", username, err)
 	}
+
 	return nil
+}
+
+// withRetry runs fn and retries it when GitHub rate limits us, instead of
+// aborting a long unfollow run because of a single throttled request.
+func (gm *GitHubManager) withRetry(fn func(ctx context.Context) error) error {
+	var err error
+
+	for attempt := 1; attempt <= maxRequestAttempts; attempt++ {
+		if err = fn(context.Background()); err == nil {
+			return nil
+		}
+
+		wait, retryable := rateLimitDelay(err)
+		if !retryable || attempt == maxRequestAttempts {
+			break
+		}
+
+		time.Sleep(wait)
+	}
+
+	return err
+}
+
+// rateLimitDelay returns how long GitHub wants us to wait and whether the
+// error is worth retrying.
+func rateLimitDelay(err error) (time.Duration, bool) {
+	var abuse *github.AbuseRateLimitError
+	if errors.As(err, &abuse) {
+		wait := time.Second
+		if abuse.RetryAfter != nil {
+			wait = *abuse.RetryAfter
+		}
+		return clampWait(wait)
+	}
+
+	var rateLimit *github.RateLimitError
+	if errors.As(err, &rateLimit) {
+		return clampWait(time.Until(rateLimit.Rate.Reset.Time) + time.Second)
+	}
+
+	var errorResponse *github.ErrorResponse
+	if errors.As(err, &errorResponse) && errorResponse.Response != nil {
+		switch errorResponse.Response.StatusCode {
+		case http.StatusTooManyRequests, http.StatusForbidden:
+			if wait, ok := retryAfterHeader(errorResponse.Response); ok {
+				return clampWait(wait)
+			}
+			if errorResponse.Response.StatusCode == http.StatusTooManyRequests {
+				return clampWait(time.Second)
+			}
+		case http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return clampWait(time.Second)
+		}
+	}
+
+	return 0, false
+}
+
+// retryAfterHeader reads the Retry-After header, which GitHub may send as a
+// number of seconds or as an HTTP date.
+func retryAfterHeader(resp *http.Response) (time.Duration, bool) {
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		return time.Duration(seconds) * time.Second, true
+	}
+
+	if when, err := http.ParseTime(raw); err == nil {
+		return time.Until(when), true
+	}
+
+	return 0, false
+}
+
+func clampWait(wait time.Duration) (time.Duration, bool) {
+	if wait <= 0 {
+		wait = 100 * time.Millisecond
+	}
+	if wait > maxRateLimitWait {
+		return 0, false
+	}
+
+	return wait, true
 }

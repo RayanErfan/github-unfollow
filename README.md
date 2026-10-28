@@ -12,7 +12,8 @@ A powerful Go-based command-line tool to manage your GitHub following relationsh
 
 - 🔍 **Follow Management**: Follow followers of a specific user who don't follow you back
 - 🗑️ **Unfollow Cleanup**: Unfollow users who don't follow you back
-- ⚡ **Efficient Processing**: Handle large numbers of followers/following with pagination
+- ⚡ **Efficient Processing**: Walk **every** API page of followers/following, so big accounts are never cut off after the first 100
+- 🔁 **Resilient Runs**: Retry rate-limited requests and keep going past individual failures instead of aborting mid-run
 - 🛡️ **Safe Execution**: Interactive confirmation before bulk operations
 - 🚀 **Concurrent Processing**: Configurable worker pool for fast execution
 - 🔐 **Secure Authentication**: OAuth2 token-based GitHub API authentication

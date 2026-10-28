@@ -2,8 +2,8 @@ package cli
 
 import (
 	"fmt"
-	"os"
 	"strings"
+	"sync"
 
 	"github.com/dbunt1tled/github-unfollow/internal/config"
 	"github.com/dbunt1tled/github-unfollow/internal/git_hub_manager"
@@ -67,24 +67,123 @@ func unFollowCommand() *cobra.Command {
 				}
 			}
 
-			wp := worker.NewWorker(cfg.WorkerCount, cfg.QueueSize)
-			wp.Start()
-
-			for _, user := range toUnfollow {
-				wp.AddTask(func() {
-					err = gm.UnfollowUser(user, cfg.TimeDelay)
-					if err != nil {
-						fmt.Printf("Error unfollow %s: %v", user, err)
-						os.Exit(1)
-					}
-					fmt.Printf("UnFollowed %s\n", user)
-				})
-
-			}
-			wp.Wait()
-			wp.Stop()
-
-			return nil
+			return unfollowEveryPage(gm, cfg)
 		},
 	}
+}
+
+// unfollowEveryPage unfollows everyone who does not follow back, walking every
+// page of the following list instead of only the first one.
+//
+// It works in passes: each pass re-reads the full (paginated) follower and
+// following lists, unfollows the users it has not tried yet, and repeats until
+// a pass finds nothing new. Re-reading between passes keeps the tool correct
+// even when the list shifts while it is being unfollowed, which is what used
+// to leave accounts partially cleaned.
+func unfollowEveryPage(gm *git_hub_manager.GitHubManager, cfg *config.Config) error {
+	var (
+		attempted  = make(map[string]struct{})
+		unfollowed int
+		failed     int
+	)
+
+	for pass := 1; ; pass++ {
+		batch, err := pendingUnfollows(gm, attempted)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		fmt.Printf("\nPass %d: unfollowing %d users...\n", pass, len(batch))
+
+		ok, bad := runUnfollowBatch(gm, cfg, batch, attempted)
+		unfollowed += ok
+		failed += bad
+
+		// Retrying the same users over and over would loop forever when the
+		// API keeps rejecting them.
+		if ok == 0 {
+			break
+		}
+	}
+
+	fmt.Printf("\nDone. Unfollowed: %d, failed: %d\n", unfollowed, failed)
+
+	if failed > 0 {
+		return fmt.Errorf("%d users could not be unfollowed", failed)
+	}
+
+	return nil
+}
+
+// pendingUnfollows returns the users that do not follow back and have not been
+// processed yet. Both lists are read completely, page by page.
+func pendingUnfollows(gm *git_hub_manager.GitHubManager, attempted map[string]struct{}) ([]string, error) {
+	followers, err := gm.GetFollowers(nil)
+	if err != nil {
+		return nil, err
+	}
+	following, err := gm.GetFollowing()
+	if err != nil {
+		return nil, err
+	}
+
+	diff := gm.DiffUsernames(followers, following)
+
+	batch := make([]string, 0, len(diff))
+	for _, user := range diff {
+		if _, done := attempted[user]; done {
+			continue
+		}
+		batch = append(batch, user)
+	}
+
+	return batch, nil
+}
+
+// runUnfollowBatch unfollows the batch concurrently and returns the number of
+// successes and failures. A failing user never aborts the whole run.
+func runUnfollowBatch(
+	gm *git_hub_manager.GitHubManager,
+	cfg *config.Config,
+	batch []string,
+	attempted map[string]struct{},
+) (int, int) {
+	var (
+		mu         sync.Mutex
+		unfollowed int
+		failed     int
+	)
+
+	wp := worker.NewWorker(cfg.WorkerCount, cfg.QueueSize)
+	wp.Start()
+
+	for _, user := range batch {
+		user := user
+		attempted[user] = struct{}{}
+
+		wp.AddTask(func() {
+			if err := gm.UnfollowUser(user, cfg.TimeDelay); err != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+
+				fmt.Printf("Error unfollow %s: %v\n", user, err)
+				return
+			}
+
+			mu.Lock()
+			unfollowed++
+			mu.Unlock()
+
+			fmt.Printf("UnFollowed %s\n", user)
+		})
+	}
+
+	wp.Wait()
+	wp.Stop()
+
+	return unfollowed, failed
 }
