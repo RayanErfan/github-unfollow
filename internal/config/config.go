@@ -10,11 +10,12 @@ import (
 )
 
 type Config struct {
-	GitHubToken    string `mapstructure:"github_token"`
-	GitHubUsername string `mapstructure:"github_username"`
-	WorkerCount    int    `mapstructure:"worker_count"`
-	QueueSize      int    `mapstructure:"queue_size"`
-	TimeDelay      int    `mapstructure:"time_delay_ms"`
+	GitHubToken    string   `mapstructure:"github_token"`
+	GitHubUsername string   `mapstructure:"github_username"`
+	ProtectedUsers []string `mapstructure:"protected_users"`
+	WorkerCount    int      `mapstructure:"worker_count"`
+	QueueSize      int      `mapstructure:"queue_size"`
+	TimeDelay      int      `mapstructure:"time_delay_ms"`
 }
 
 func Load() (*Config, error) {
@@ -23,6 +24,11 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
+	// Defaults are required for AutomaticEnv: viper only exposes an environment
+	// variable when the key is known (default or explicit binding).
+	v.SetDefault("github_token", "")
+	v.SetDefault("github_username", "")
+	v.SetDefault("protected_users", "")
 	v.SetDefault("worker_count", 1)
 	v.SetDefault("queue_size", 3)
 	v.SetDefault("time_delay_ms", 2000)

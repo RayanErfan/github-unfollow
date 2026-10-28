@@ -28,24 +28,34 @@ const (
 )
 
 type GitHubManager struct {
-	client   *github.Client
-	username string
+	client         *github.Client
+	username       string
+	extraProtected map[string]struct{}
 }
 
-func NewGitHubManager(token string, username string) *GitHubManager {
+func NewGitHubManager(token string, username string, protected ...string) *GitHubManager {
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	tc := oauth2.NewClient(context.Background(), ts)
 
-	return NewGitHubManagerWithClient(github.NewClient(tc), username)
+	return NewGitHubManagerWithClient(github.NewClient(tc), username, protected...)
 }
 
 // NewGitHubManagerWithClient builds a manager around an existing client.
 // It exists so tests can point the client at a local server.
-func NewGitHubManagerWithClient(client *github.Client, username string) *GitHubManager {
-	return &GitHubManager{
-		client:   client,
-		username: username,
+func NewGitHubManagerWithClient(client *github.Client, username string, protected ...string) *GitHubManager {
+	gm := &GitHubManager{
+		client:         client,
+		username:       username,
+		extraProtected: make(map[string]struct{}, len(protected)),
 	}
+
+	for _, login := range protected {
+		if login = normalizeLogin(login); login != "" {
+			gm.extraProtected[login] = struct{}{}
+		}
+	}
+
+	return gm
 }
 
 // userPageFetcher fetches one page of users.
@@ -121,6 +131,12 @@ func (gm *GitHubManager) DiffUsernames(users1 []string, users2 []string) []strin
 }
 
 func (gm *GitHubManager) UnfollowUser(username string, delay int) error {
+	// Hard safety net: protected accounts are never unfollowed, even if a
+	// caller forgets to filter them out first.
+	if gm.isProtected(username) {
+		return nil
+	}
+
 	time.Sleep(time.Duration(delay) * time.Millisecond)
 
 	err := gm.withRetry(func(ctx context.Context) error {

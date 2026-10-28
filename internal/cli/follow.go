@@ -42,7 +42,7 @@ func followCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("failed to get force flag: %w", err)
 			}
-			gm := git_hub_manager.NewGitHubManager(cfg.GitHubToken, cfg.GitHubUsername)
+			gm := git_hub_manager.NewGitHubManager(cfg.GitHubToken, cfg.GitHubUsername, cfg.ProtectedUsers...)
 			followers, err = gm.GetFollowers(&username)
 			if err != nil {
 				return err

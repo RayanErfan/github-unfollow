@@ -39,7 +39,7 @@ func unFollowCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("failed to get force flag: %w", err)
 			}
-			gm := git_hub_manager.NewGitHubManager(cfg.GitHubToken, cfg.GitHubUsername)
+			gm := git_hub_manager.NewGitHubManager(cfg.GitHubToken, cfg.GitHubUsername, cfg.ProtectedUsers...)
 			followers, err = gm.GetFollowers(nil)
 			if err != nil {
 				return err
@@ -50,6 +50,12 @@ func unFollowCommand() *cobra.Command {
 			}
 
 			toUnfollow = gm.DiffUsernames(followers, following)
+
+			rawCount := len(toUnfollow)
+			toUnfollow = gm.ExcludeProtected(toUnfollow)
+			if skipped := rawCount - len(toUnfollow); skipped > 0 {
+				fmt.Printf("Skipping %d protected account(s)\n", skipped)
+			}
 
 			for i, user := range toUnfollow {
 				fmt.Printf("%d. %s\n", i+1, user)
@@ -130,7 +136,7 @@ func pendingUnfollows(gm *git_hub_manager.GitHubManager, attempted map[string]st
 		return nil, err
 	}
 
-	diff := gm.DiffUsernames(followers, following)
+	diff := gm.ExcludeProtected(gm.DiffUsernames(followers, following))
 
 	batch := make([]string, 0, len(diff))
 	for _, user := range diff {

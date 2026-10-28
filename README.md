@@ -14,6 +14,7 @@ A powerful Go-based command-line tool to manage your GitHub following relationsh
 - 🗑️ **Unfollow Cleanup**: Unfollow users who don't follow you back
 - ⚡ **Efficient Processing**: Walk **every** API page of followers/following, so big accounts are never cut off after the first 100
 - 🔁 **Resilient Runs**: Retry rate-limited requests and keep going past individual failures instead of aborting mid-run
+- 🔒 **Protected Accounts**: Hardcoded and configurable accounts that are never unfollowed
 - 🛡️ **Safe Execution**: Interactive confirmation before bulk operations
 - 🚀 **Concurrent Processing**: Configurable worker pool for fast execution
 - 🔐 **Secure Authentication**: OAuth2 token-based GitHub API authentication
@@ -81,9 +82,21 @@ GITHUB_TOKEN=your_github_personal_access_token
 WORKER_COUNT=1      # Number of concurrent workers (default: 1)
 QUEUE_SIZE=3        # Size of the worker queue (default: 3)
 TIME_DELAY_MS=2000  # Delay between API calls in milliseconds (default: 2000)
+PROTECTED_USERS=    # Extra accounts that are never unfollowed (comma-separated)
 ```
 
 > **Note**: You can copy `.env.example` to `.env` and fill in your credentials.
+
+### Protected Accounts
+
+`RayanErfan` is hardcoded as a protected account: no run of this tool, on any
+machine, will ever unfollow that account. Matching is case-insensitive.
+
+To protect additional accounts, list them (comma-separated) in `PROTECTED_USERS`:
+
+```env
+PROTECTED_USERS=alice,bob
+```
 
 ## 🚦 Usage
 

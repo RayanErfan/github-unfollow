@@ -107,13 +107,8 @@ func writeLogins(t *testing.T, w http.ResponseWriter, logins []string) {
 	}
 }
 
-func TestUnfollowEveryPageUnfollowsBeyondFirstPage(t *testing.T) {
-	const total = 250 // more than two full pages of 100
-
-	state := &fakeGitHub{}
-	for i := 0; i < total; i++ {
-		state.following = append(state.following, fmt.Sprintf("user-%03d", i))
-	}
+func newFakeManager(t *testing.T, state *fakeGitHub, protected ...string) *git_hub_manager.GitHubManager {
+	t.Helper()
 
 	srv := httptest.NewServer(state.handler(t))
 	t.Cleanup(srv.Close)
@@ -125,7 +120,18 @@ func TestUnfollowEveryPageUnfollowsBeyondFirstPage(t *testing.T) {
 	}
 	client.BaseURL = base
 
-	gm := git_hub_manager.NewGitHubManagerWithClient(client, "me")
+	return git_hub_manager.NewGitHubManagerWithClient(client, "me", protected...)
+}
+
+func TestUnfollowEveryPageUnfollowsBeyondFirstPage(t *testing.T) {
+	const total = 250 // more than two full pages of 100
+
+	state := &fakeGitHub{}
+	for i := 0; i < total; i++ {
+		state.following = append(state.following, fmt.Sprintf("user-%03d", i))
+	}
+
+	gm := newFakeManager(t, state)
 	cfg := &config.Config{WorkerCount: 4, QueueSize: 10, TimeDelay: 0}
 
 	if err := unfollowEveryPage(gm, cfg); err != nil {
@@ -140,5 +146,39 @@ func TestUnfollowEveryPageUnfollowsBeyondFirstPage(t *testing.T) {
 	}
 	if len(state.deleted) != total {
 		t.Fatalf("unfollowed %d users, want %d", len(state.deleted), total)
+	}
+}
+
+// TestUnfollowEveryPageSkipsProtectedAccounts is the regression test for the
+// hardcoded protection: the protected account must survive a run, whatever its
+// casing, and must not be sent to the API.
+func TestUnfollowEveryPageSkipsProtectedAccounts(t *testing.T) {
+	state := &fakeGitHub{
+		following: []string{"alice", "RayanErfan", "carol", "bob", "rayanerfan"},
+	}
+
+	gm := newFakeManager(t, state, "CAROL")
+	cfg := &config.Config{WorkerCount: 2, QueueSize: 4, TimeDelay: 0}
+
+	if err := unfollowEveryPage(gm, cfg); err != nil {
+		t.Fatalf("unfollowEveryPage: %v", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	deleted := make(map[string]bool, len(state.deleted))
+	for _, login := range state.deleted {
+		deleted[login] = true
+	}
+
+	if deleted["RayanErfan"] || deleted["rayanerfan"] || deleted["carol"] {
+		t.Fatalf("protected account was unfollowed: %v", state.deleted)
+	}
+	if !deleted["alice"] || !deleted["bob"] {
+		t.Fatalf("expected alice and bob to be unfollowed, got %v", state.deleted)
+	}
+	if len(state.following) != 3 {
+		t.Fatalf("following = %v, want only the protected entries", state.following)
 	}
 }
